@@ -414,6 +414,197 @@ void tiff_free(tiff_image *img) {
     memset(img, 0, sizeof *img);
 }
 
+/* ============================================================================
+ * Multi-page volume read with LZW (Compression=5) + uncompressed (=1) support.
+ * ==========================================================================*/
+
+/* TIFF LZW: MSB-first bit packing, 9..12 bit codes, ClearCode 256, EOI 257,
+ * "early change" (bump code width one code before the table would overflow),
+ * no Predictor. Decodes into dst (capacity dstcap); returns bytes written. */
+static long lzw_decode(const uint8_t *src, size_t srclen,
+                       uint8_t *dst, size_t dstcap) {
+    enum { CLEAR = 256, EOI = 257, MAXCODE = 4096 };
+    uint16_t prefix[MAXCODE];
+    uint8_t  suffix[MAXCODE];
+    uint8_t  stack[MAXCODE];
+    size_t   outpos = 0, bitpos = 0, nbits = srclen * 8;
+    int bits = 9, next = 258, oldcode = -1, firstchar = 0;
+
+    while (bitpos + (size_t)bits <= nbits) {
+        /* read `bits` bits, MSB-first */
+        int code = 0;
+        for (int i = 0; i < bits; i++) {
+            size_t bp = bitpos + i;
+            int b = (src[bp >> 3] >> (7 - (bp & 7))) & 1;
+            code = (code << 1) | b;
+        }
+        bitpos += bits;
+
+        if (code == EOI) break;
+        if (code == CLEAR) { bits = 9; next = 258; oldcode = -1; continue; }
+
+        int sp = 0, cur = code;
+        if (cur >= next) {                 /* KwKwK special case */
+            if (oldcode < 0) break;        /* malformed */
+            stack[sp++] = (uint8_t)firstchar;
+            cur = oldcode;
+        }
+        while (cur >= 256) { stack[sp++] = suffix[cur]; cur = prefix[cur]; }
+        firstchar = cur;
+        stack[sp++] = (uint8_t)cur;
+
+        while (sp > 0 && outpos < dstcap) dst[outpos++] = stack[--sp];
+
+        if (oldcode >= 0 && next < MAXCODE) {
+            prefix[next] = (uint16_t)oldcode;
+            suffix[next] = (uint8_t)firstchar;
+            next++;
+            if (next == (1 << bits) - 1 && bits < 12) bits++;  /* early change */
+        }
+        oldcode = code;
+        if (outpos >= dstcap) break;
+    }
+    return (long)outpos;
+}
+
+/* Decode one strip (compression 1 = raw copy, 5 = LZW) into dst[..dstcap]. */
+static int decode_strip(uint32_t comp, const uint8_t *src, size_t srclen,
+                        uint8_t *dst, size_t dstcap, size_t *written) {
+    if (comp == 1) {
+        size_t t = srclen < dstcap ? srclen : dstcap;
+        memcpy(dst, src, t);
+        *written = t;
+        return TIFF_OK;
+    }
+    if (comp == 5) {
+        long w = lzw_decode(src, srclen, dst, dstcap);
+        if (w < 0) return TIFF_EFORMAT;
+        *written = (size_t)w;
+        return TIFF_OK;
+    }
+    return TIFF_EUNSUPPORTED;
+}
+
+int tiff_read_volume(const char *path, tiff_volume *vol) {
+    if (!path || !vol) return TIFF_EINVAL;
+    memset(vol, 0, sizeof *vol);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return TIFF_EOPEN;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return TIFF_EIO; }
+    long flen = ftell(f);
+    if (flen < 8) { fclose(f); return TIFF_EFORMAT; }
+    rewind(f);
+    uint8_t *fb = malloc((size_t)flen);
+    if (!fb) { fclose(f); return TIFF_EMEM; }
+    if (fread(fb, 1, (size_t)flen, f) != (size_t)flen) { free(fb); fclose(f); return TIFF_EIO; }
+    fclose(f);
+    size_t n = (size_t)flen;
+
+    int rc = TIFF_EFORMAT, big;
+    entry *es = NULL;
+    uint32_t *soff = NULL, *scnt = NULL;
+    uint8_t *out = NULL;
+
+    if      (fb[0] == 'I' && fb[1] == 'I') big = 0;
+    else if (fb[0] == 'M' && fb[1] == 'M') big = 1;
+    else goto done;
+    if (rd16(fb + 2, big) != 42) { rc = TIFF_EUNSUPPORTED; goto done; }
+
+    uint32_t W = 0, H = 0, spp = 0, depth = 0;
+    tiff_type type = TIFF_U8;
+    size_t ts = 0, pagebytes = 0;
+
+    uint32_t ifd = rd32(fb + 4, big);
+    while (ifd != 0) {
+        if ((uint64_t)ifd + 2 > n) goto done;
+        int ne = rd16(fb + ifd, big);
+        if (ne <= 0 || ifd + 2 + (uint64_t)ne * 12 + 4 > n) goto done;
+        free(es);
+        es = malloc((size_t)ne * sizeof *es);
+        if (!es) { rc = TIFF_EMEM; goto done; }
+        for (int i = 0; i < ne; i++) {
+            size_t p = ifd + 2 + (size_t)i * 12;
+            es[i].tag = rd16(fb + p, big); es[i].type = rd16(fb + p + 2, big);
+            es[i].count = rd32(fb + p + 4, big); es[i].valoff = (uint32_t)(p + 8);
+        }
+        uint32_t next_ifd = rd32(fb + ifd + 2 + (size_t)ne * 12, big);
+
+        uint32_t comp = read_scalar(fb, n, big, es, ne, T_COMPRESSION, 1);
+        if (read_scalar(fb, n, big, es, ne, T_PLANARCONFIG, 1) != 1) { rc = TIFF_EUNSUPPORTED; goto done; }
+        if (find(es, ne, T_TILEWIDTH)) { rc = TIFF_EUNSUPPORTED; goto done; }
+        uint32_t w = read_scalar(fb, n, big, es, ne, T_WIDTH, 0);
+        uint32_t h = read_scalar(fb, n, big, es, ne, T_LENGTH, 0);
+        uint32_t s = read_scalar(fb, n, big, es, ne, T_SAMPLESPP, 1);
+        if (w == 0 || h == 0 || s == 0 || s > 0xffff) goto done;
+
+        int bits;
+        { const entry *en = find(es, ne, T_BITSPERSAMP);
+          bits = en ? (int)read_scalar(fb, n, big, es, ne, T_BITSPERSAMP, 1) : 1; }
+        int sf = SF_UINT;
+        { const entry *en = find(es, ne, T_SAMPLEFORMAT);
+          if (en) sf = (int)read_scalar(fb, n, big, es, ne, T_SAMPLEFORMAT, SF_UINT); }
+        tiff_type pt;
+        if (decode_type(sf, bits, &pt) != 0) { rc = TIFF_EUNSUPPORTED; goto done; }
+
+        if (depth == 0) {
+            W = w; H = h; spp = s; type = pt;
+            ts = tiff_type_size(type);
+            pagebytes = (size_t)W * H * spp * ts;
+        } else if (w != W || h != H || s != spp || pt != type) {
+            rc = TIFF_EUNSUPPORTED; goto done;   /* pages must be uniform */
+        }
+
+        const entry *eo = find(es, ne, T_STRIPOFFSETS);
+        const entry *ec = find(es, ne, T_STRIPCOUNTS);
+        if (!eo || !ec || eo->count == 0 || eo->count != ec->count) { rc = TIFF_EUNSUPPORTED; goto done; }
+        uint32_t nstrips = eo->count;
+        free(soff); free(scnt);
+        soff = malloc((size_t)nstrips * sizeof *soff);
+        scnt = malloc((size_t)nstrips * sizeof *scnt);
+        if (!soff || !scnt) { rc = TIFF_EMEM; goto done; }
+        if (read_ints(fb, n, big, eo, soff, nstrips) != (long)nstrips ||
+            read_ints(fb, n, big, ec, scnt, nstrips) != (long)nstrips) goto done;
+
+        uint8_t *grown = realloc(out, (size_t)(depth + 1) * pagebytes);
+        if (!grown) { rc = TIFF_EMEM; goto done; }
+        out = grown;
+        uint8_t *slice = out + (size_t)depth * pagebytes;
+
+        size_t pos = 0;
+        for (uint32_t i = 0; i < nstrips; i++) {
+            if ((uint64_t)soff[i] + scnt[i] > n) goto done;
+            if (pos >= pagebytes) break;
+            size_t wrote = 0;
+            int sr = decode_strip(comp, fb + soff[i], scnt[i],
+                                  slice + pos, pagebytes - pos, &wrote);
+            if (sr != TIFF_OK) { rc = sr; goto done; }
+            pos += wrote;
+        }
+        if (pos != pagebytes) goto done;   /* short page */
+
+        depth++;
+        if (next_ifd != 0 && next_ifd <= ifd) goto done;  /* non-monotonic: bail */
+        ifd = next_ifd;
+    }
+    if (depth == 0) goto done;
+
+    vol->width = W; vol->height = H; vol->depth = depth;
+    vol->channels = (uint16_t)spp; vol->type = type; vol->data = out;
+    out = NULL;
+    rc = TIFF_OK;
+
+done:
+    free(es); free(soff); free(scnt); free(out); free(fb);
+    return rc;
+}
+
+void tiff_volume_free(tiff_volume *vol) {
+    if (!vol) return;
+    free(vol->data);
+    memset(vol, 0, sizeof *vol);
+}
+
 /* ###########################################################################
  * Custom 2D near-lossless codec (see codec API in tiff.h).
  * ######################################################################### */

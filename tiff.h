@@ -81,6 +81,26 @@ int tiff_read(const char *path, tiff_image *img);
 /* Free img->data and zero the struct. Safe on a zeroed/already-freed image. */
 void tiff_free(tiff_image *img);
 
+/* ---- multi-page volume read (z-stack of equally sized pages) ----------------
+ * Reads a multi-IFD TIFF where each IFD is one z-slice, into a single z-major
+ * volume: data holds depth*height*width*channels samples, slice-major then
+ * row-major chunky, i.e. idx = ((z*height + y)*width + x)*channels + c. Supports
+ * baseline stripped TIFF with Compression = 1 (none) or 5 (LZW, MSB-first,
+ * Predictor=none), single PlanarConfiguration, either byte order — the layout the
+ * Vesuvius surface-detection volumes use. All pages must share
+ * width/height/channels/type. Allocates vol->data; free with tiff_volume_free. */
+typedef struct {
+    uint32_t  width;     /* x, fastest                                    */
+    uint32_t  height;    /* y                                             */
+    uint32_t  depth;     /* z, slowest (number of pages / IFDs)           */
+    uint16_t  channels;  /* samples per pixel (>= 1)                      */
+    tiff_type type;      /* sample type, shared by all pages              */
+    void     *data;      /* depth*height*width*channels samples           */
+} tiff_volume;
+
+int  tiff_read_volume(const char *path, tiff_volume *vol);
+void tiff_volume_free(tiff_volume *vol);
+
 /* ===========================================================================
  * Custom 2D near-lossless codec (NOT standard TIFF; not viewable in a normal
  * viewer). Per-plane compression on a 64x64 float DCT: all transform math is
