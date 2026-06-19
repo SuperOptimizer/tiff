@@ -101,6 +101,10 @@ typedef struct {
 int  tiff_read_volume(const char *path, tiff_volume *vol);
 void tiff_volume_free(tiff_volume *vol);
 
+/* Write a single-channel volume as an uncompressed multi-page TIFF (one IFD per
+ * z-slice) — the format the official metric / PIL ImageSequence reads back. */
+int  tiff_write_volume(const char *path, const tiff_volume *vol);
+
 /* ===========================================================================
  * Custom 2D near-lossless codec (NOT standard TIFF; not viewable in a normal
  * viewer). Per-plane compression on a 64x64 float DCT: all transform math is

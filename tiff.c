@@ -605,6 +605,70 @@ void tiff_volume_free(tiff_volume *vol) {
     memset(vol, 0, sizeof *vol);
 }
 
+/* Write a single-channel volume as an uncompressed multi-page TIFF (one IFD per
+ * z-slice), the layout read by PIL/ImageSequence (and our own tiff_read_volume).
+ * Each page carries the minimal baseline tags; pages are chained via next-IFD. */
+int tiff_write_volume(const char *path, const tiff_volume *vol) {
+    if (!path || !vol || !vol->data) return TIFF_EINVAL;
+    if (vol->channels != 1 || vol->width == 0 || vol->height == 0 || vol->depth == 0)
+        return TIFF_EINVAL;
+    size_t ts = tiff_type_size(vol->type);
+    if (ts == 0) return TIFF_EINVAL;
+    const uint32_t W = vol->width, H = vol->height, D = vol->depth;
+    const int bits = type_bits(vol->type), sf = type_format(vol->type);
+    const uint64_t pagebytes = (uint64_t)W * H * ts;
+    if (pagebytes > 0xffffffffULL) return TIFF_EUNSUPPORTED;
+
+    const int n_entries = 11;
+    const size_t ifd_bytes = 2 + (size_t)n_entries * 12 + 4;
+    const size_t page_block = ifd_bytes + (size_t)pagebytes;   /* IFD then pixels */
+    const uint64_t total = 8 + (uint64_t)D * page_block;
+    if (total > 0xffffffffULL) return TIFF_EUNSUPPORTED;        /* classic TIFF only */
+
+    uint8_t *buf = calloc(1, (size_t)total);
+    if (!buf) return TIFF_EMEM;
+    buf[0] = 'I'; buf[1] = 'I';
+    put16(buf, 2, 42);
+    put32(buf, 4, 8);                                          /* first IFD at 8 */
+
+    const uint8_t *src = (const uint8_t *)vol->data;
+    for (uint32_t k = 0; k < D; k++) {
+        size_t pstart = 8 + (size_t)k * page_block;
+        size_t pix    = pstart + ifd_bytes;
+        size_t next   = (k + 1 < D) ? pstart + page_block : 0;
+
+        put16(buf, pstart, (uint16_t)n_entries);
+        size_t e = pstart + 2;
+        #define ENTRY(tag, ftype, count, value) do { \
+            put16(buf, e, (uint16_t)(tag));    put16(buf, e+2, (uint16_t)(ftype)); \
+            put32(buf, e+4, (uint32_t)(count)); put32(buf, e+8, (uint32_t)(value)); \
+            e += 12; } while (0)
+        ENTRY(T_WIDTH,        FT_LONG,  1, W);
+        ENTRY(T_LENGTH,       FT_LONG,  1, H);
+        ENTRY(T_BITSPERSAMP,  FT_SHORT, 1, (uint32_t)bits);
+        ENTRY(T_COMPRESSION,  FT_SHORT, 1, 1);                 /* none */
+        ENTRY(T_PHOTOMETRIC,  FT_SHORT, 1, 1);                 /* BlackIsZero */
+        ENTRY(T_STRIPOFFSETS, FT_LONG,  1, (uint32_t)pix);
+        ENTRY(T_SAMPLESPP,    FT_SHORT, 1, 1);
+        ENTRY(T_ROWSPERSTRIP, FT_LONG,  1, H);                 /* one strip */
+        ENTRY(T_STRIPCOUNTS,  FT_LONG,  1, (uint32_t)pagebytes);
+        ENTRY(T_PLANARCONFIG, FT_SHORT, 1, 1);                 /* chunky */
+        ENTRY(T_SAMPLEFORMAT, FT_SHORT, 1, (uint32_t)sf);
+        #undef ENTRY
+        put32(buf, pstart + 2 + (size_t)n_entries * 12, (uint32_t)next);
+
+        memcpy(buf + pix, src + (size_t)k * pagebytes, (size_t)pagebytes);
+    }
+
+    int rc = TIFF_OK;
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(buf); return TIFF_EOPEN; }
+    if (fwrite(buf, 1, (size_t)total, f) != (size_t)total) rc = TIFF_EIO;
+    if (fclose(f) != 0 && rc == TIFF_OK) rc = TIFF_EIO;
+    free(buf);
+    return rc;
+}
+
 /* ###########################################################################
  * Custom 2D near-lossless codec (see codec API in tiff.h).
  * ######################################################################### */
